@@ -51,6 +51,13 @@ async function loadMediaPipeHands(): Promise<any | null> {
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
+export type StreamHealth = "healthy" | "stalled" | "disconnected" | "unknown";
+
+export interface CameraDevice {
+  deviceId: string;
+  label: string;
+}
+
 export interface GestureTrackingState {
   isLoading: boolean;
   isActive: boolean;
@@ -59,6 +66,9 @@ export interface GestureTrackingState {
   result: GestureResult | null;
   analytics: GestureAnalytics;
   calibration: CalibrationProfile;
+  cameras: CameraDevice[];
+  selectedCameraId: string | null;
+  streamHealth: StreamHealth;
 }
 
 export interface AirDrawEvent {
@@ -178,6 +188,9 @@ export function useGestureTracking({
   const lastProcessTimeRef    = useRef(0);
   const FRAME_INTERVAL        = 1000 / 30;
 
+  const healthIntervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const selectedCameraRef  = useRef<string | null>(null);
+
   const [state, setState] = useState<GestureTrackingState>({
     isLoading: false,
     isActive: false,
@@ -186,6 +199,9 @@ export function useGestureTracking({
     result: null,
     analytics: analyticsRef.current,
     calibration: engineRef.current.getCalibration(),
+    cameras: [],
+    selectedCameraId: null,
+    streamHealth: "unknown",
   });
 
   // ── Skeleton Overlay ─────────────────────────────────────────────────────────
@@ -537,139 +553,238 @@ export function useGestureTracking({
   // Store ref for hands.onResults registration
   onResultsRef.current = onResults;
 
-  // ── Start Tracking ───────────────────────────────────────────────────────────
+  // ── Camera device enumeration ────────────────────────────────────────────────
 
-  const start = useCallback(async () => {
-    setState((prev) => ({ ...prev, isLoading: true, error: null }));
-
+  const enumerateCameras = useCallback(async (): Promise<CameraDevice[]> => {
     try {
-      // ── WebRTC camera stream ─────────────────────────────────────────────
-      let stream: MediaStream;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices
+        .filter((d) => d.kind === "videoinput")
+        .map((d, i) => ({
+          deviceId: d.deviceId,
+          label: d.label || `Camera ${i + 1}`,
+        }));
+    } catch {
+      return [];
+    }
+  }, []);
+
+  // ── Start Tracking (with retry + device enumeration + health monitoring) ──────
+
+  const startWithDeviceId = useCallback(async (deviceId?: string | null) => {
+    setState((prev) => ({ ...prev, isLoading: true, error: null, streamHealth: "unknown" }));
+
+    // ── Camera stream — up to 3 attempts ──────────────────────────────────────
+    let stream: MediaStream | null = null;
+    let lastErr: any = null;
+
+    const attempts: ConstrainDOMString[] = deviceId
+      ? [deviceId]
+      : ["user", "environment", "user"];  // try user-facing first
+
+    for (let attempt = 0; attempt < 3 && !stream; attempt++) {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-            facingMode: "user",
-            frameRate: { ideal: 30, max: 60 },
-          },
-          audio: false,
-        });
-      } catch {
-        // Fallback: minimal constraints
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
-          audio: false,
-        });
+        const videoConstraint: MediaTrackConstraints = attempt === 0 && deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }
+          : attempt === 0
+          ? { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }
+          : { facingMode: attempts[attempt] ?? "user" };
+
+        stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraint, audio: false });
+      } catch (e: any) {
+        lastErr = e;
+        // Permission errors — stop immediately, don't retry
+        if (e?.name === "NotAllowedError" || e?.name === "PermissionDeniedError") break;
+        // Brief pause before retry
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 800));
       }
+    }
 
-      streamRef.current = stream;
-      setState((prev) => ({ ...prev, cameraPermission: "granted" }));
-
-      // ── Video element (hidden processing element) ────────────────────────
-      let video = videoRef.current;
-      if (!video) {
-        video = document.createElement("video");
-        video.id = "__aircanvas-gesture-video__";
-        video.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;pointer-events:none;";
-        video.playsInline = true;
-        video.muted = true;
-        document.body.appendChild(video);
-        videoRef.current = video;
-      }
-      video.srcObject = stream;
-      await video.play();
-
-      // ── PiP video element (for recording engine) ─────────────────────────
-      let pipVideo = document.getElementById("__aircanvas-pip-video__") as HTMLVideoElement | null;
-      if (!pipVideo) {
-        pipVideo = document.createElement("video");
-        pipVideo.id = "__aircanvas-pip-video__";
-        pipVideo.style.cssText = "position:fixed;bottom:-9999px;left:-9999px;width:1px;height:1px;";
-        pipVideo.playsInline = true;
-        pipVideo.muted = true;
-        document.body.appendChild(pipVideo);
-      }
-      pipVideo.srcObject = stream;
-      pipVideo.play().catch(() => {});
-
-      // ── Visible display video (renders live feed in GesturePanel) ────────
-      if (videoDisplayRef?.current) {
-        videoDisplayRef.current.srcObject = stream;
-        videoDisplayRef.current.play().catch(() => {});
-      }
-
-      // ── Preprocessing canvas for low-light compensation ──────────────────
-      if (!preprocessCanvasRef.current) {
-        const pc = document.createElement("canvas");
-        pc.width = 640;
-        pc.height = 480;
-        preprocessCanvasRef.current = pc;
-        preprocessCtxRef.current = pc.getContext("2d", { willReadFrequently: false });
-      }
-
-      // ── Load MediaPipe Hands ─────────────────────────────────────────────
-      const HandsClass = await loadMediaPipeHands();
-      if (!HandsClass) throw new Error("MediaPipe failed to load. Check your internet connection.");
-
-      const hands = new HandsClass({
-        locateFile: (file: string) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
-      });
-
-      hands.setOptions({
-        maxNumHands: 1,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.55,
-        minTrackingConfidence: 0.5,
-      });
-
-      // Use ref wrapper so onResults always calls the latest version
-      hands.onResults((r: any) => onResultsRef.current(r));
-      handsRef.current = hands;
-
-      // Size overlay canvas
-      const overlayCanvas = overlayCanvasRef.current;
-      if (overlayCanvas) {
-        overlayCanvas.width = 640;
-        overlayCanvas.height = 480;
-      }
-
-      // Reset all state
-      landmarkSmootherRef.current.reset();
-      airWritingFilterRef.current.reset();
-      motionPredictorRef.current.reset();
-      engineRef.current.reset();
-      analyticsRef.current.reset();
-      drawingActiveRef.current = false;
-      lastAirPosRef.current = null;
-      lastGestureRef.current = "NONE";
-      lastProcessTimeRef.current = 0;
-      lightCheckCountRef.current = 0;
-      lightFilterRef.current = "none";
-
-      setState((prev) => ({
-        ...prev,
-        isLoading: false,
-        isActive: true,
-        error: null,
-      }));
-
-      animFrameRef.current = requestAnimationFrame(processFrame);
-
-    } catch (err: any) {
-      const isDenied = err?.name === "NotAllowedError" || err?.name === "PermissionDeniedError";
+    if (!stream) {
+      const isDenied = lastErr?.name === "NotAllowedError" || lastErr?.name === "PermissionDeniedError";
       setState((prev) => ({
         ...prev,
         isLoading: false,
         isActive: false,
+        streamHealth: "disconnected",
         error: isDenied
-          ? "Camera access denied. Please allow camera access in your browser settings and try again."
-          : err?.message ?? "Failed to start gesture tracking.",
+          ? "Camera access denied. Click the camera icon in your browser's address bar and allow access, then try again."
+          : lastErr?.name === "NotFoundError"
+          ? "No camera found. Please connect a webcam and try again."
+          : lastErr?.name === "NotReadableError"
+          ? "Camera is in use by another app. Close other apps using the camera and try again."
+          : lastErr?.message ?? "Failed to access camera. Please check your camera and browser settings.",
         cameraPermission: isDenied ? "denied" : "unknown",
       }));
+      return;
     }
-  }, [processFrame, overlayCanvasRef]);
+
+    streamRef.current = stream;
+    selectedCameraRef.current = deviceId ?? stream.getVideoTracks()[0]?.getSettings().deviceId ?? null;
+
+    // ── Enumerate all available cameras (now that permission is granted) ──────
+    const cameras = await enumerateCameras();
+
+    setState((prev) => ({
+      ...prev,
+      cameraPermission: "granted",
+      cameras,
+      selectedCameraId: selectedCameraRef.current,
+    }));
+
+    // ── Hidden video element for MediaPipe processing ─────────────────────────
+    let video = videoRef.current;
+    if (!video) {
+      video = document.createElement("video");
+      video.id = "__aircanvas-gesture-video__";
+      video.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;pointer-events:none;";
+      video.playsInline = true;
+      video.muted = true;
+      document.body.appendChild(video);
+      videoRef.current = video;
+    }
+    video.srcObject = stream;
+    try { await video.play(); }
+    catch { /* autoplay blocked — processFrame handles readyState check */ }
+
+    // ── PiP element for recording ─────────────────────────────────────────────
+    let pipVideo = document.getElementById("__aircanvas-pip-video__") as HTMLVideoElement | null;
+    if (!pipVideo) {
+      pipVideo = document.createElement("video");
+      pipVideo.id = "__aircanvas-pip-video__";
+      pipVideo.style.cssText = "position:fixed;bottom:-9999px;left:-9999px;width:1px;height:1px;";
+      pipVideo.playsInline = true;
+      pipVideo.muted = true;
+      document.body.appendChild(pipVideo);
+    }
+    pipVideo.srcObject = stream;
+    pipVideo.play().catch(() => {});
+
+    // ── Visible display video in GesturePanel ─────────────────────────────────
+    if (videoDisplayRef?.current) {
+      videoDisplayRef.current.srcObject = stream;
+      videoDisplayRef.current.play().catch(() => {});
+    }
+
+    // ── Preprocessing canvas ──────────────────────────────────────────────────
+    if (!preprocessCanvasRef.current) {
+      const pc = document.createElement("canvas");
+      pc.width = 640;
+      pc.height = 480;
+      preprocessCanvasRef.current = pc;
+      preprocessCtxRef.current = pc.getContext("2d", { willReadFrequently: false });
+    }
+
+    // ── Load MediaPipe Hands ──────────────────────────────────────────────────
+    const HandsClass = await loadMediaPipeHands();
+    if (!HandsClass) {
+      stream.getTracks().forEach((t) => t.stop());
+      setState((prev) => ({
+        ...prev, isLoading: false, isActive: false, streamHealth: "disconnected",
+        error: "MediaPipe failed to load. Check your internet connection and try again.",
+      }));
+      return;
+    }
+
+    const hands = new HandsClass({
+      locateFile: (file: string) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.55,
+      minTrackingConfidence: 0.50,
+    });
+    hands.onResults((r: any) => onResultsRef.current(r));
+    handsRef.current = hands;
+
+    // Size overlay canvas
+    if (overlayCanvasRef.current) {
+      overlayCanvasRef.current.width  = 640;
+      overlayCanvasRef.current.height = 480;
+    }
+
+    // Reset internal state
+    landmarkSmootherRef.current.reset();
+    airWritingFilterRef.current.reset();
+    motionPredictorRef.current.reset();
+    engineRef.current.reset();
+    analyticsRef.current.reset();
+    drawingActiveRef.current = false;
+    lastAirPosRef.current    = null;
+    lastGestureRef.current   = "NONE";
+    lastProcessTimeRef.current  = 0;
+    lightCheckCountRef.current  = 0;
+    lightFilterRef.current      = "none";
+
+    setState((prev) => ({
+      ...prev,
+      isLoading: false,
+      isActive: true,
+      error: null,
+      streamHealth: "healthy",
+    }));
+
+    animFrameRef.current = requestAnimationFrame(processFrame);
+
+    // ── Stream health monitoring — detect stalled/disconnected streams ─────────
+    if (healthIntervalRef.current) clearInterval(healthIntervalRef.current);
+    healthIntervalRef.current = setInterval(() => {
+      const v = videoRef.current;
+      const s = streamRef.current;
+      if (!v || !s) return;
+
+      // Check if any track ended (camera disconnected / revoked)
+      const trackEnded = s.getTracks().some((t) => t.readyState === "ended");
+      if (trackEnded) {
+        setState((prev) => ({ ...prev, streamHealth: "disconnected", error: "Camera disconnected. Click Reconnect to restart." }));
+        clearInterval(healthIntervalRef.current!);
+        return;
+      }
+
+      // Check if video element has stalled
+      const health: StreamHealth = v.readyState >= 2 ? "healthy" : v.readyState >= 1 ? "stalled" : "unknown";
+      setState((prev) => ({ ...prev, streamHealth: health }));
+    }, 2500);
+
+  }, [processFrame, overlayCanvasRef, enumerateCameras]);
+
+  const start = useCallback(() => startWithDeviceId(null), [startWithDeviceId]);
+
+  // ── Switch Camera ─────────────────────────────────────────────────────────────
+
+  const switchCamera = useCallback(async (deviceId: string) => {
+    // Stop current stream first
+    if (animFrameRef.current !== null) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (healthIntervalRef.current) { clearInterval(healthIntervalRef.current); }
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    handsRef.current?.close?.();
+    handsRef.current = null;
+    // Then restart with the selected device
+    await startWithDeviceId(deviceId);
+  }, [startWithDeviceId]);
+
+  // ── Reconnect / Restart ───────────────────────────────────────────────────────
+
+  const restart = useCallback(async () => {
+    if (animFrameRef.current !== null) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (healthIntervalRef.current) clearInterval(healthIntervalRef.current);
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    handsRef.current?.close?.();
+    handsRef.current = null;
+    drawingActiveRef.current = false;
+    setState((prev) => ({ ...prev, isActive: false, result: null, streamHealth: "unknown" }));
+    await startWithDeviceId(selectedCameraRef.current);
+  }, [startWithDeviceId]);
 
   // ── Stop Tracking ────────────────────────────────────────────────────────────
 
@@ -677,6 +792,10 @@ export function useGestureTracking({
     if (animFrameRef.current !== null) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
+    }
+    if (healthIntervalRef.current) {
+      clearInterval(healthIntervalRef.current);
+      healthIntervalRef.current = null;
     }
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
@@ -691,7 +810,6 @@ export function useGestureTracking({
       videoRef.current = null;
     }
 
-    // Clear display video
     if (videoDisplayRef?.current) {
       videoDisplayRef.current.srcObject = null;
     }
@@ -702,7 +820,12 @@ export function useGestureTracking({
     landmarkSmootherRef.current.reset();
     motionPredictorRef.current.reset();
 
-    setState((prev) => ({ ...prev, isActive: false, result: null }));
+    setState((prev) => ({
+      ...prev,
+      isActive: false,
+      result: null,
+      streamHealth: "unknown",
+    }));
   }, []);
 
   // ── Update Calibration ───────────────────────────────────────────────────────
@@ -724,6 +847,9 @@ export function useGestureTracking({
   return {
     start,
     stop,
+    restart,
+    switchCamera,
+    enumerateCameras,
     updateCalibration,
     videoRef,
     state,

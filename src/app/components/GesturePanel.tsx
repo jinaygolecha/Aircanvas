@@ -16,7 +16,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import {
   X, Hand, Camera, CameraOff, Settings2, BarChart2, Activity,
   ChevronDown, ChevronUp, AlertCircle, CheckCircle, Loader2,
-  Sliders, History, Info, Zap, Wifi, WifiOff,
+  Sliders, History, Info, Zap, Wifi, WifiOff, RefreshCw,
 } from "lucide-react";
 import { useGestureTracking, type AirDrawEvent } from "../hooks/useGestureTracking";
 import { GestureCalibration } from "./GestureCalibration";
@@ -65,7 +65,7 @@ export function GesturePanel({
   const [showDiagnostics, setShowDiagnostics] = useState(true);
 
   const {
-    start, stop, updateCalibration,
+    start, stop, restart, switchCamera, updateCalibration,
     state, analytics, getHistory, getUsageMap,
   } = useGestureTracking({
     canvasRef,
@@ -78,6 +78,15 @@ export function GesturePanel({
   const result = state.result;
   const quality = result?.trackingQuality ?? "LOST";
   const qualityColor = QUALITY_COLORS[quality];
+
+  // Stream health color
+  const healthColors: Record<string, string> = {
+    healthy: "#10b981",
+    stalled: "#f59e0b",
+    disconnected: "#ef4444",
+    unknown: "#6b6890",
+  };
+  const healthColor = healthColors[state.streamHealth ?? "unknown"];
 
   const handleCalibrationSave = useCallback((profile: Partial<CalibrationProfile>) => {
     updateCalibration(profile);
@@ -139,29 +148,61 @@ export function GesturePanel({
 
       {!isMinimized && (
         <div className="flex flex-col overflow-y-auto" style={{ scrollbarWidth: "none", flex: 1 }}>
-          {/* Start/Stop */}
+          {/* Start/Stop + Camera selector */}
           {!state.isActive && (
-            <div className="p-4">
+            <div className="p-4 space-y-3">
+              {/* Error banner */}
               {state.error && (
-                <div className="mb-3 p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)" }}>
+                <div className="p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)" }}>
                   <AlertCircle size={14} className="text-red-400 shrink-0 mt-0.5" />
-                  <p style={{ fontFamily: "var(--font-family-body)", color: "#fca5a5", fontSize: "0.75rem", lineHeight: 1.5 }}>{state.error}</p>
+                  <div>
+                    <p style={{ fontFamily: "var(--font-family-body)", color: "#fca5a5", fontSize: "0.75rem", lineHeight: 1.5 }}>{state.error}</p>
+                    {state.cameraPermission === "denied" && (
+                      <p style={{ fontFamily: "var(--font-family-mono)", color: "#f87171", fontSize: "0.65rem", marginTop: "4px" }}>
+                        Click the 🔒 icon in your browser address bar → allow camera
+                      </p>
+                    )}
+                  </div>
                 </div>
               )}
+
+              {/* Camera selector (shown when cameras are available) */}
+              {state.cameras.length > 1 && (
+                <div>
+                  <p style={{ fontFamily: "var(--font-family-mono)", fontSize: "0.6rem", color: "#6b6890", marginBottom: "6px" }}>SELECT CAMERA</p>
+                  <select
+                    value={state.selectedCameraId ?? ""}
+                    onChange={(e) => switchCamera(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg text-xs outline-none"
+                    style={{
+                      background: "#141425",
+                      border: "1px solid rgba(124,58,237,0.2)",
+                      color: "#f0eefc",
+                      fontFamily: "var(--font-family-body)",
+                    }}
+                  >
+                    {state.cameras.map((cam) => (
+                      <option key={cam.deviceId} value={cam.deviceId}>{cam.label}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {/* Start button */}
               <button
                 onClick={start}
                 disabled={state.isLoading}
-                className="w-full py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all hover:opacity-90"
+                className="w-full py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all hover:opacity-90 disabled:opacity-60"
                 style={{ background: "linear-gradient(135deg, #7C3AED, #5b21b6)", color: "white", fontFamily: "var(--font-family-display)" }}
               >
-                {state.isLoading ? (
-                  <><Loader2 size={15} className="animate-spin" /> Loading MediaPipe...</>
-                ) : (
-                  <><Camera size={15} /> Start Gesture Control</>
-                )}
+                {state.isLoading
+                  ? <><Loader2 size={15} className="animate-spin" /> Initializing camera…</>
+                  : <><Camera size={15} /> Start Gesture Control</>
+                }
               </button>
-              <p className="mt-2 text-center" style={{ fontFamily: "var(--font-family-mono)", fontSize: "0.65rem", color: "#4a4a6a" }}>
-                Camera permission required
+
+              <p className="text-center" style={{ fontFamily: "var(--font-family-mono)", fontSize: "0.6rem", color: "#4a4a6a" }}>
+                Requires camera permission · Works in Chrome, Edge, Firefox
               </p>
             </div>
           )}
@@ -332,6 +373,43 @@ export function GesturePanel({
                       )}
                     </div>
                   </div>
+
+                  {/* Stream health indicator */}
+                  {state.streamHealth !== "unknown" && (
+                    <div className="flex items-center justify-between px-3 py-2 rounded-xl"
+                      style={{ background: "#141425", border: "1px solid rgba(124,58,237,0.08)" }}>
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full" style={{ background: healthColor }} />
+                        <span style={{ fontFamily: "var(--font-family-mono)", fontSize: "0.6rem", color: healthColor }}>
+                          STREAM {state.streamHealth.toUpperCase()}
+                        </span>
+                      </div>
+                      {(state.streamHealth === "stalled" || state.streamHealth === "disconnected") && (
+                        <button onClick={restart}
+                          className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs transition-all hover:opacity-80"
+                          style={{ background: "rgba(124,58,237,0.2)", color: "#a78bfa", fontFamily: "var(--font-family-display)" }}>
+                          <RefreshCw size={11} /> Reconnect
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Camera selector (when multiple available) */}
+                  {state.cameras.length > 1 && (
+                    <div>
+                      <p style={{ fontFamily: "var(--font-family-mono)", fontSize: "0.6rem", color: "#6b6890", marginBottom: "4px" }}>CAMERA</p>
+                      <select
+                        value={state.selectedCameraId ?? ""}
+                        onChange={(e) => switchCamera(e.target.value)}
+                        className="w-full px-2 py-1.5 rounded-lg text-xs outline-none"
+                        style={{ background: "#141425", border: "1px solid rgba(124,58,237,0.15)", color: "#f0eefc", fontFamily: "var(--font-family-body)" }}
+                      >
+                        {state.cameras.map((cam) => (
+                          <option key={cam.deviceId} value={cam.deviceId}>{cam.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
 
                   {/* Stop button */}
                   <button

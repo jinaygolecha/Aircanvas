@@ -9,14 +9,14 @@ import {
   Layers, ArrowLeft, Maximize2, Home, BookOpen, FileText,
   RotateCcw, Image as ImageIcon, Palette, Bold, Italic,
   AlignLeft, AlignCenter, AlignRight, Copy, Scissors,
-  // New icons for added features
-  Hand, Film, Cpu, Loader2,
+  Hand, Film, Cpu, Loader2, MonitorPlay,
 } from "lucide-react";
 import * as Gemini from "../lib/geminiService";
 import { useRecording } from "../hooks/useRecording";
 import { GesturePanel } from "./GesturePanel";
 import { VideoOCRPanel } from "./VideoOCRPanel";
 import { AIFeaturesPanel } from "./AIFeaturesPanel";
+import { VideoNavigationPanel, type VideoNavRef } from "./VideoNavigationPanel";
 import type { AirDrawEvent } from "../hooks/useGestureTracking";
 
 type Tool = "pen" | "eraser" | "rect" | "circle" | "line" | "text" | "select" | "triangle";
@@ -117,6 +117,8 @@ export function WhiteboardApp() {
   const [gestureOpen, setGestureOpen] = useState(false);
   const [ocrOpen, setOcrOpen] = useState(false);
   const [aiFeaturesOpen, setAiFeaturesOpen] = useState(false);
+  const [videoNavOpen, setVideoNavOpen] = useState(false);
+  const videoNavRef = useRef<VideoNavRef>(null);
   const [isAirWriting, setIsAirWriting] = useState(false);
   const airStrokeRef = useRef<StrokePoint[]>([]);
   const airStrokeActiveRef = useRef(false);
@@ -412,6 +414,12 @@ export function WhiteboardApp() {
 
   // ── Gesture activated callback ────────────────────────────────────────────
   const handleGestureActivated = useCallback((gesture: string) => {
+    // When Video Navigation panel is open, route ALL gestures there instead
+    if (videoNavOpen && videoNavRef.current) {
+      videoNavRef.current.handleGesture(gesture);
+      return;
+    }
+
     switch (gesture) {
       case "THUMBS_UP":
         handleDownload();
@@ -556,6 +564,7 @@ export function WhiteboardApp() {
         setGestureOpen(false);
         setOcrOpen(false);
         setAiFeaturesOpen(false);
+        setVideoNavOpen(false);
       }
     };
     window.addEventListener("keydown", handler);
@@ -693,7 +702,7 @@ export function WhiteboardApp() {
             </div>
           )}
 
-          {/* ── NEW: Video OCR button ── */}
+          {/* ── Video OCR button ── */}
           <button
             onClick={() => setOcrOpen(!ocrOpen)}
             className="w-8 h-8 flex items-center justify-center rounded-lg transition-all"
@@ -705,6 +714,20 @@ export function WhiteboardApp() {
             }}
           >
             <Film size={15} />
+          </button>
+
+          {/* ── AI Video Navigation button ── */}
+          <button
+            onClick={() => setVideoNavOpen(!videoNavOpen)}
+            className="w-8 h-8 flex items-center justify-center rounded-lg transition-all"
+            title="AI Video Navigation (Gesture Control)"
+            style={{
+              background: videoNavOpen ? "rgba(124,58,237,0.25)" : "rgba(255,255,255,0.04)",
+              color: videoNavOpen ? "#a78bfa" : "#6b6890",
+              border: videoNavOpen ? "1px solid rgba(124,58,237,0.4)" : "1px solid transparent",
+            }}
+          >
+            <MonitorPlay size={15} />
           </button>
 
           {/* ── NEW: AI Features button ── */}
@@ -1028,6 +1051,13 @@ export function WhiteboardApp() {
             sessionType: "lecture",
           }}
           canvasContent={`Board: "${boardName}" with ${strokes.length} drawn elements.`}
+        />
+      )}
+
+      {videoNavOpen && (
+        <VideoNavigationPanel
+          ref={videoNavRef}
+          onClose={() => setVideoNavOpen(false)}
         />
       )}
     </div>
